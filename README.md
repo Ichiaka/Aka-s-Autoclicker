@@ -56,3 +56,12 @@ The executable will be generated in the `dist/` folder.
 | Boot with Windows | Check the option in the UI |
 | Minimize to tray | Close the window (X minimizes to tray) |
 | Quit completely | Right-click tray icon → Salir |
+
+---
+
+## Version History
+
+| Version | Changes |
+|---|---|
+| **v6** | Hold delay configurable — tiempo de espera antes de activar el autoclick, permite clicks normales sin interferencia |
+| **v1** | Primera versión. UI básica, slider de intervalo, inicio automático con Windows |

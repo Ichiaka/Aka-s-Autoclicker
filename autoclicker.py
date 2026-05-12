@@ -5,9 +5,6 @@ Dependencias:   pip install pynput pystray pillow
 Ejecutar:       python autoclicker.py
 EXE:            pip install pyinstaller
                 python -m PyInstaller --onefile --windowed --name "AkasAutoClicker" autoclicker
-
-
-
 """
 
 import tkinter as tk
@@ -86,16 +83,18 @@ def remove_from_startup():
 
 # ── Estado autoclicker ────────────────────────────────────────────────────────
 class State:
-    enabled     = False
-    held_left   = False
-    held_right  = False
-    held_middle = False
-    interval_ms = 50
-    _lock       = threading.Lock()
-    _firing     = False
+    enabled        = False
+    held_left      = False
+    held_right     = False
+    held_middle    = False
+    interval_ms    = 50
+    hold_delay_ms  = 300    # ms que hay que mantener antes de empezar
+    _lock          = threading.Lock()
+    _firing        = False
 
 state = State()
 _click_thread = None
+_delay_timer  = None       # threading.Timer para el hold delay
 
 def click_loop():
     while True:
@@ -114,7 +113,8 @@ def click_loop():
             state._firing = False
         time.sleep(max(0.001, interval))
 
-def maybe_start_thread():
+def _start_click_thread():
+    """Arranca el hilo de clicks si el botón sigue pulsado tras el delay."""
     global _click_thread
     with state._lock:
         running = _click_thread and _click_thread.is_alive()
@@ -122,6 +122,25 @@ def maybe_start_thread():
     if should and not running:
         _click_thread = threading.Thread(target=click_loop, daemon=True)
         _click_thread.start()
+
+def maybe_start_thread():
+    """Espera hold_delay_ms y luego arranca si el botón sigue pulsado."""
+    global _delay_timer
+    if _delay_timer and _delay_timer.is_alive():
+        _delay_timer.cancel()
+    with state._lock:
+        delay = state.hold_delay_ms / 1000.0
+    if delay <= 0:
+        _start_click_thread()
+    else:
+        _delay_timer = threading.Timer(delay, _start_click_thread)
+        _delay_timer.daemon = True
+        _delay_timer.start()
+
+def _cancel_delay():
+    global _delay_timer
+    if _delay_timer and _delay_timer.is_alive():
+        _delay_timer.cancel()
 
 _BTN_ATTR = {
     pmouse.Button.left:   "held_left",
@@ -134,7 +153,10 @@ def on_mouse_event(x, y, button, pressed):
         if state._firing: return
         attr = _BTN_ATTR.get(button)
         if attr: setattr(state, attr, pressed)
-    if pressed: maybe_start_thread()
+    if pressed:
+        maybe_start_thread()
+    else:
+        _cancel_delay()  # soltaron antes del delay → click normal, no autoclick
 
 mouse_listener = pmouse.Listener(on_click=on_mouse_event)
 mouse_listener.start()
@@ -415,7 +437,7 @@ def make_sep(parent,y,width=320):
 # ── App ───────────────────────────────────────────────────────────────────────
 class App(tk.Tk):
     W = 320
-    H = 390
+    H = 480
 
     def __init__(self):
         super().__init__()
@@ -451,22 +473,22 @@ class App(tk.Tk):
 
         make_sep(self, Y)
 
-        # intervalo
-        rf = tk.Frame(self, bg=BG)
-        rf.place(x=20, y=Y+10)
-        tk.Label(rf, text=":: CLICK INTERVAL ::",
+        # ── hold delay ────────────────────────────────────────────────────────
+        hf = tk.Frame(self, bg=BG)
+        hf.place(x=20, y=Y+10)
+        tk.Label(hf, text=":: HOLD DELAY ::",
                  font=("Courier New",8,"bold"), bg=BG, fg=TEXT_MID).pack(side="left")
-        self._ms_lbl = tk.Label(rf, text=f"[ {state.interval_ms} ms ]",
+        self._hd_lbl = tk.Label(hf, text=f"[ {state.hold_delay_ms} ms ]",
                                 font=("Courier New",8,"bold"), bg=BG, fg=CYAN)
-        self._ms_lbl.pack(side="left", padx=8)
+        self._hd_lbl.pack(side="left", padx=8)
 
-        self._slider = CrackSlider(self, 1, 500, state.interval_ms, self._on_slider)
-        self._slider.place(x=20, y=Y+28)
+        self._hd_slider = CrackSlider(self, 0, 1000, state.hold_delay_ms, self._on_hd_slider)
+        self._hd_slider.place(x=20, y=Y+28)
 
-        pf = tk.Frame(self, bg=BG)
-        pf.place(x=20, y=Y+62)
-        for lbl,val in [("MAX",1),("50ms",50),("100ms",100),("250ms",250)]:
-            tk.Button(pf, text=lbl, command=lambda v=val:self._set_interval(v),
+        hpf = tk.Frame(self, bg=BG)
+        hpf.place(x=20, y=Y+62)
+        for lbl,val in [("0ms",0),("100ms",100),("300ms",300),("500ms",500)]:
+            tk.Button(hpf, text=lbl, command=lambda v=val: self._set_hd(v),
                       font=("Courier New",8,"bold"), bg=GREY, fg=TEXT_MID,
                       activebackground=GREY2, activeforeground=GREEN,
                       relief="flat", bd=0, padx=8, pady=3,
@@ -474,19 +496,42 @@ class App(tk.Tk):
 
         make_sep(self, Y+90)
 
+        # ── click interval ────────────────────────────────────────────────────
+        rf = tk.Frame(self, bg=BG)
+        rf.place(x=20, y=Y+100)
+        tk.Label(rf, text=":: CLICK INTERVAL ::",
+                 font=("Courier New",8,"bold"), bg=BG, fg=TEXT_MID).pack(side="left")
+        self._ms_lbl = tk.Label(rf, text=f"[ {state.interval_ms} ms ]",
+                                font=("Courier New",8,"bold"), bg=BG, fg=CYAN)
+        self._ms_lbl.pack(side="left", padx=8)
+
+        self._slider = CrackSlider(self, 1, 500, state.interval_ms, self._on_slider)
+        self._slider.place(x=20, y=Y+118)
+
+        pf = tk.Frame(self, bg=BG)
+        pf.place(x=20, y=Y+152)
+        for lbl,val in [("MAX",1),("50ms",50),("100ms",100),("250ms",250)]:
+            tk.Button(pf, text=lbl, command=lambda v=val:self._set_interval(v),
+                      font=("Courier New",8,"bold"), bg=GREY, fg=TEXT_MID,
+                      activebackground=GREY2, activeforeground=GREEN,
+                      relief="flat", bd=0, padx=8, pady=3,
+                      cursor="hand2").pack(side="left", padx=(0,5))
+
+        make_sep(self, Y+180)
+
         self._btn = CrackButton(self, text="ACTIVATE",
                                 command=self.toggle_enabled,
                                 active_text="DEACTIVATE", active_fg=RED_AC)
-        self._btn.place(x=20, y=Y+100)
+        self._btn.place(x=20, y=Y+192)
 
         self._status = tk.Label(self, text=">_ STATUS: STANDBY",
                                 font=("Courier New",9,"bold"), bg=BG, fg=TEXT_DIM)
-        self._status.place(x=20, y=Y+154)
+        self._status.place(x=20, y=Y+246)
 
-        make_sep(self, Y+172)
+        make_sep(self, Y+264)
 
         cbf = tk.Frame(self, bg=BG)
-        cbf.place(x=20, y=Y+184)
+        cbf.place(x=20, y=Y+276)
         self._startup_var = tk.BooleanVar(value=is_in_startup())
         tk.Checkbutton(cbf, text="  BOOT WITH WINDOWS",
                        variable=self._startup_var,
@@ -497,10 +542,10 @@ class App(tk.Tk):
                        cursor="hand2").pack(anchor="w")
 
         tk.Label(self, text="F6 = QUICK TOGGLE",
-                 font=("Courier New",8), bg=BG, fg=TEXT_DIM).place(x=20, y=Y+214)
+                 font=("Courier New",8), bg=BG, fg=TEXT_DIM).place(x=20, y=Y+306)
 
-        make_sep(self, Y+232)
-        Ticker(self).place(x=0, y=Y+240)
+        make_sep(self, Y+324)
+        Ticker(self).place(x=0, y=Y+332)
 
     # ── drag ──────────────────────────────────────────────────────────────────
     def _drag_start(self, e):
@@ -551,6 +596,14 @@ class App(tk.Tk):
             text=">_ STATUS: ACTIVE — HOLD MOUSE BTN" if on else ">_ STATUS: STANDBY",
             fg=GREEN if on else TEXT_DIM)
         maybe_start_thread()
+
+    def _on_hd_slider(self, val):
+        v = int(val)
+        with state._lock: state.hold_delay_ms = v
+        self._hd_lbl.config(text=f"[ {v} ms ]")
+
+    def _set_hd(self, val):
+        self._hd_slider.set(val); self._on_hd_slider(val)
 
     def _on_slider(self, val):
         v = int(val)
