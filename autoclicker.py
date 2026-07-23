@@ -247,6 +247,17 @@ SM_XVIRTUALSCREEN=76; SM_YVIRTUALSCREEN=77; SM_CXVIRTUALSCREEN=78; SM_CYVIRTUALS
 _u32.GetSystemMetrics.argtypes = [ctypes.c_int]
 _u32.GetSystemMetrics.restype  = ctypes.c_int
 
+# instancia única (mutex) + traer la ventana existente al frente
+_k32 = ctypes.windll.kernel32
+_k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+_k32.CreateMutexW.restype  = wintypes.HANDLE
+_k32.GetLastError.restype  = wintypes.DWORD
+_u32.FindWindowW.argtypes  = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+_u32.FindWindowW.restype   = wintypes.HWND
+_u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+_u32.SetForegroundWindow.restype  = wintypes.BOOL
+_instance_mutex = None
+
 def _over_own_window(x, y):
     hwnd = _app_hwnd
     if not hwnd or not _u32.IsWindowVisible(hwnd):
@@ -542,7 +553,7 @@ class GraffitiTitle(tk.Canvas):
 
 
 class Ticker(tk.Canvas):
-    MSG = ("  *** AKA'S AUTOCLICKER v6.0 ***   "
+    MSG = ("  *** AKA'S AUTOCLICKER v7.0 ***   "
            "HOLD LEFT/MIDDLE TO RAPID FIRE   "
            "RIGHT-CLICK = LOCK AUTOFIRE — MOVE MOUSE TO CANCEL   "
            "F6 = TOGGLE ON/OFF   "
@@ -922,6 +933,22 @@ class App(tk.Tk):
         self.geometry(f"{self.W}x{self.H}+{int(x)}+{int(y)}")
 
 
+def _ensure_single_instance():
+    """Impide una segunda instancia: si ya hay una, la muestra al frente y sale."""
+    global _instance_mutex
+    ERROR_ALREADY_EXISTS = 183
+    _instance_mutex = _k32.CreateMutexW(None, False, "AkasAutoClicker_SingleInstance_Mutex")
+    if _k32.GetLastError() == ERROR_ALREADY_EXISTS:
+        try:
+            hwnd = _u32.FindWindowW(None, "Aka's AutoClicker")
+            if hwnd:
+                _u32.ShowWindow(hwnd, SW_SHOW)
+                _u32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        sys.exit(0)
+
+_ensure_single_instance()
 app = App()
 _start_input_listeners()   # arranca hook de ratón + teclado con la app ya creada
 app.mainloop()
