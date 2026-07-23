@@ -1,16 +1,16 @@
 """
 Aka's AutoClicker
 
-Dependencias:   pip install pynput pystray pillow
+Dependencias:   pip install pystray pillow
 Ejecutar:       python autoclicker.py
 EXE:            pip install pyinstaller
-                python -m PyInstaller --onefile --windowed --name "AkasAutoClicker" autoclicker
+                python -m PyInstaller --onefile --windowed --name "AkasAutoClicker" autoclicker.py
 """
 
 import tkinter as tk
 import threading
 import time
-import sys, os, math, random
+import sys, os, math, random, json
 import winreg
 import ctypes
 
@@ -20,31 +20,37 @@ def _pip(pkg):
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 try:
-    from pynput import mouse as pmouse, keyboard as pkeyboard
-except ImportError:
-    _pip("pynput")
-    from pynput import mouse as pmouse, keyboard as pkeyboard
-
-try:
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageTk
 except ImportError:
     _pip("pystray"); _pip("pillow")
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageTk
 
 # ── ctypes mouse_event ────────────────────────────────────────────────────────
+from ctypes import wintypes
+
 _u32 = ctypes.windll.user32
+ULONG_PTR = ctypes.c_size_t
+LRESULT   = ctypes.c_ssize_t
+
+_u32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                             wintypes.DWORD, ULONG_PTR]
+_u32.mouse_event.restype  = None
+
 MOUSEEVENTF_LEFTDOWN   = 0x0002; MOUSEEVENTF_LEFTUP     = 0x0004
 MOUSEEVENTF_RIGHTDOWN  = 0x0008; MOUSEEVENTF_RIGHTUP    = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020; MOUSEEVENTF_MIDDLEUP   = 0x0040
 _DOWN = {"left":MOUSEEVENTF_LEFTDOWN, "right":MOUSEEVENTF_RIGHTDOWN, "middle":MOUSEEVENTF_MIDDLEDOWN}
 _UP   = {"left":MOUSEEVENTF_LEFTUP,   "right":MOUSEEVENTF_RIGHTUP,   "middle":MOUSEEVENTF_MIDDLEUP}
 
+# Firma para marcar nuestros propios clicks inyectados y así no auto-dispararnos.
+INJECTED_SIGNATURE = 0xACC11CE5
+
 def _send_click(button):
-    _u32.mouse_event(_DOWN[button], 0, 0, 0, 0)
+    _u32.mouse_event(_DOWN[button], 0, 0, 0, INJECTED_SIGNATURE)
     time.sleep(0.002)
-    _u32.mouse_event(_UP[button],   0, 0, 0, 0)
+    _u32.mouse_event(_UP[button],   0, 0, 0, INJECTED_SIGNATURE)
 
 # ── Paleta ────────────────────────────────────────────────────────────────────
 BG        = "#050505"
@@ -62,8 +68,11 @@ WHITE     = "#e8ffe8"
 # ── Registro ──────────────────────────────────────────────────────────────────
 APP_NAME = "AkasAutoClicker"
 REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+# En modo script usa pythonw.exe para no abrir una consola al arrancar con Windows.
+_PYW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+_RUN = _PYW if os.path.exists(_PYW) else sys.executable
 EXE_PATH = sys.executable if getattr(sys, 'frozen', False) else \
-           f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+           f'"{_RUN}" "{os.path.abspath(__file__)}"'
 
 def is_in_startup():
     try:
@@ -81,18 +90,52 @@ def remove_from_startup():
         winreg.DeleteValue(key, APP_NAME); winreg.CloseKey(key)
     except FileNotFoundError: pass
 
+# ── Configuración persistente ─────────────────────────────────────────────────
+CONFIG_DIR  = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+CONFIG_DEFAULTS = {
+    "interval_ms":   50,
+    "hold_delay_ms": 300,
+    "ontop":         False,
+    "taskbar":       False,
+    "win_x":         None,
+    "win_y":         None,
+}
+
+def load_config():
+    cfg = dict(CONFIG_DEFAULTS)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in CONFIG_DEFAULTS:
+            if k in data:
+                cfg[k] = data[k]
+    except Exception:
+        pass
+    return cfg
+
+def save_config(cfg):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
 # ── Estado autoclicker ────────────────────────────────────────────────────────
 class State:
     enabled        = False
     held_left      = False
-    held_right     = False
     held_middle    = False
+    locked         = False   # autoclick fijado (toggle con el botón derecho)
     interval_ms    = 50
     hold_delay_ms  = 300    # ms que hay que mantener antes de empezar
+    _lock_x        = 0       # ancla para cancelar el lock al mover el ratón
+    _lock_y        = 0
     _lock          = threading.Lock()
-    _firing        = False
 
 state = State()
+_ctl_lock     = threading.Lock()   # protege _click_thread y _delay_timer
 _click_thread = None
 _delay_timer  = None       # threading.Timer para el hold delay
 
@@ -101,72 +144,230 @@ def click_loop():
         with state._lock:
             if not state.enabled: break
             buttons = []
-            if state.held_left:   buttons.append("left")
-            if state.held_right:  buttons.append("right")
-            if state.held_middle: buttons.append("middle")
+            if state.locked or state.held_left: buttons.append("left")
+            if state.held_middle:               buttons.append("middle")
             if not buttons: break
             interval = state.interval_ms / 1000.0
-            state._firing = True
         for btn in buttons:
             _send_click(btn)
-        with state._lock:
-            state._firing = False
         time.sleep(max(0.001, interval))
 
 def _start_click_thread():
     """Arranca el hilo de clicks si el botón sigue pulsado tras el delay."""
     global _click_thread
     with state._lock:
+        should = state.enabled and (state.locked or state.held_left or state.held_middle)
+    with _ctl_lock:
         running = _click_thread and _click_thread.is_alive()
-        should  = state.enabled and (state.held_left or state.held_right or state.held_middle)
-    if should and not running:
-        _click_thread = threading.Thread(target=click_loop, daemon=True)
-        _click_thread.start()
+        if should and not running:
+            _click_thread = threading.Thread(target=click_loop, daemon=True)
+            _click_thread.start()
 
 def maybe_start_thread():
     """Espera hold_delay_ms y luego arranca si el botón sigue pulsado."""
     global _delay_timer
-    if _delay_timer and _delay_timer.is_alive():
-        _delay_timer.cancel()
     with state._lock:
         delay = state.hold_delay_ms / 1000.0
     if delay <= 0:
+        with _ctl_lock:
+            if _delay_timer and _delay_timer.is_alive():
+                _delay_timer.cancel()
         _start_click_thread()
     else:
-        _delay_timer = threading.Timer(delay, _start_click_thread)
-        _delay_timer.daemon = True
-        _delay_timer.start()
+        with _ctl_lock:
+            if _delay_timer and _delay_timer.is_alive():
+                _delay_timer.cancel()
+            _delay_timer = threading.Timer(delay, _start_click_thread)
+            _delay_timer.daemon = True
+            _delay_timer.start()
 
 def _cancel_delay():
     global _delay_timer
-    if _delay_timer and _delay_timer.is_alive():
-        _delay_timer.cancel()
+    with _ctl_lock:
+        if _delay_timer and _delay_timer.is_alive():
+            _delay_timer.cancel()
 
-_BTN_ATTR = {
-    pmouse.Button.left:   "held_left",
-    pmouse.Button.right:  "held_right",
-    pmouse.Button.middle: "held_middle",
+# ── Hook de ratón de bajo nivel (WH_MOUSE_LL) ─────────────────────────────────
+# Distingue los clicks reales de los que inyectamos nosotros (vía dwExtraInfo),
+# de modo que el autoclicker nunca se dispara a sí mismo ni pierde la liberación
+# del botón durante el disparo rápido.
+WH_MOUSE_LL    = 14
+WH_KEYBOARD_LL = 13
+WM_MOUSEMOVE  = 0x0200
+WM_LBUTTONDOWN=0x0201; WM_LBUTTONUP=0x0202
+WM_RBUTTONDOWN=0x0204; WM_RBUTTONUP=0x0205
+WM_MBUTTONDOWN=0x0207; WM_MBUTTONUP=0x0208
+WM_KEYDOWN=0x0100; WM_KEYUP=0x0101; WM_SYSKEYDOWN=0x0104; WM_SYSKEYUP=0x0105
+VK_F6 = 0x75
+
+MOVE_CANCEL_PX = 8      # umbral de movimiento (px) que cancela el lock
+
+# Solo izquierdo y central disparan por "mantener pulsado". El derecho es toggle.
+_MOUSE_MSG = {
+    WM_LBUTTONDOWN:("held_left",   True),  WM_LBUTTONUP:("held_left",   False),
+    WM_MBUTTONDOWN:("held_middle", True),  WM_MBUTTONUP:("held_middle", False),
 }
 
-def on_mouse_event(x, y, button, pressed):
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt",          wintypes.POINT),
+                ("mouseData",   wintypes.DWORD),
+                ("flags",       wintypes.DWORD),
+                ("time",        wintypes.DWORD),
+                ("dwExtraInfo", ULONG_PTR)]
+
+# ── Detección "cursor sobre nuestra ventana" ──────────────────────────────────
+# Para que el autoclicker no actúe sobre su propia interfaz aunque esté activo.
+GA_ROOT = 2
+_app_hwnd = None
+_u32.GetWindowRect.argtypes   = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+_u32.GetWindowRect.restype    = wintypes.BOOL
+_u32.IsWindowVisible.argtypes = [wintypes.HWND]
+_u32.IsWindowVisible.restype  = wintypes.BOOL
+_u32.GetAncestor.argtypes     = [wintypes.HWND, wintypes.UINT]
+_u32.GetAncestor.restype      = wintypes.HWND
+
+# ── Estilos para mostrar/ocultar en la barra de tareas ────────────────────────
+GWL_EXSTYLE      = -20
+WS_EX_TOOLWINDOW = 0x00000080   # oculta de la barra de tareas
+WS_EX_APPWINDOW  = 0x00040000   # fuerza botón en la barra de tareas
+SW_HIDE = 0; SW_SHOW = 5
+try:
+    _GetWL = _u32.GetWindowLongPtrW; _SetWL = _u32.SetWindowLongPtrW
+except AttributeError:                              # Python de 32 bits
+    _GetWL = _u32.GetWindowLongW;    _SetWL = _u32.SetWindowLongW
+_GetWL.restype  = ctypes.c_ssize_t
+_GetWL.argtypes = [wintypes.HWND, ctypes.c_int]
+_SetWL.restype  = ctypes.c_ssize_t
+_SetWL.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+_u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+_u32.ShowWindow.restype  = wintypes.BOOL
+
+# métricas del escritorio virtual (abarca todos los monitores)
+SM_XVIRTUALSCREEN=76; SM_YVIRTUALSCREEN=77; SM_CXVIRTUALSCREEN=78; SM_CYVIRTUALSCREEN=79
+_u32.GetSystemMetrics.argtypes = [ctypes.c_int]
+_u32.GetSystemMetrics.restype  = ctypes.c_int
+
+def _over_own_window(x, y):
+    hwnd = _app_hwnd
+    if not hwnd or not _u32.IsWindowVisible(hwnd):
+        return False
+    rect = wintypes.RECT()
+    if not _u32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    return rect.left <= x < rect.right and rect.top <= y < rect.bottom
+
+def _handle_mouse(attr, pressed):
     with state._lock:
-        if state._firing: return
-        attr = _BTN_ATTR.get(button)
-        if attr: setattr(state, attr, pressed)
+        setattr(state, attr, pressed)
     if pressed:
         maybe_start_thread()
     else:
-        _cancel_delay()  # soltaron antes del delay → click normal, no autoclick
+        _cancel_delay()   # soltaron antes del delay → click normal, no autoclick
 
-mouse_listener = pmouse.Listener(on_click=on_mouse_event)
-mouse_listener.start()
+def _reflect_lock(on):
+    if app is not None:
+        app.after(0, app._reflect_lock, on)
 
-def on_key_press(key):
-    if key == pkeyboard.Key.f6:
-        app.after(0, app.toggle_enabled)
+def _toggle_lock(x, y):
+    """Botón derecho: fija/quita el autoclick (clicks izquierdos en bucle)."""
+    with state._lock:
+        if not state.enabled:
+            return
+        state.locked  = not state.locked
+        state._lock_x = x
+        state._lock_y = y
+        now_locked = state.locked
+    if now_locked:
+        _start_click_thread()          # arranca ya, sin hold-delay
+    _reflect_lock(now_locked)
 
-kb_listener = pkeyboard.Listener(on_press=on_key_press)
-kb_listener.start()
+def _on_mouse_move(x, y):
+    """Cualquier movimiento real más allá del umbral cancela el lock."""
+    with state._lock:
+        if not state.locked:
+            return
+        dx = x - state._lock_x; dy = y - state._lock_y
+        if dx*dx + dy*dy < MOVE_CANCEL_PX*MOVE_CANCEL_PX:
+            return
+        state.locked = False
+    _reflect_lock(False)
+
+HOOKPROC = ctypes.CFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p)
+
+def _ll_mouse_proc(nCode, wParam, lParam):
+    try:
+        if nCode == 0 and lParam:                       # HC_ACTION
+            ms = MSLLHOOKSTRUCT.from_address(lParam)
+            if ms.dwExtraInfo != INJECTED_SIGNATURE:    # ignora nuestros propios clicks
+                if wParam == WM_MOUSEMOVE:
+                    _on_mouse_move(ms.pt.x, ms.pt.y)
+                elif _over_own_window(ms.pt.x, ms.pt.y):
+                    pass                # sobre nuestra ventana → no autoclicar, UI normal
+                elif wParam in (WM_RBUTTONDOWN, WM_RBUTTONUP):
+                    with state._lock:
+                        enabled = state.enabled
+                    if enabled:
+                        if wParam == WM_RBUTTONDOWN:
+                            _toggle_lock(ms.pt.x, ms.pt.y)
+                        return 1        # bloquea el click derecho real mientras está activo
+                else:
+                    info = _MOUSE_MSG.get(wParam)
+                    if info:
+                        _handle_mouse(*info)
+    except Exception:
+        pass
+    return _u32.CallNextHookEx(None, nCode, wParam, lParam)
+
+_ll_mouse_proc_c = HOOKPROC(_ll_mouse_proc)   # referencia viva para evitar el GC
+_u32.SetWindowsHookExW.restype  = wintypes.HHOOK
+_u32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+_u32.CallNextHookEx.restype     = LRESULT
+_u32.CallNextHookEx.argtypes    = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p]
+
+# ── Hook de teclado de bajo nivel (WH_KEYBOARD_LL) — F6 = toggle ──────────────
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode",      wintypes.DWORD),
+                ("scanCode",    wintypes.DWORD),
+                ("flags",       wintypes.DWORD),
+                ("time",        wintypes.DWORD),
+                ("dwExtraInfo", ULONG_PTR)]
+
+_f6_down = False
+
+def _ll_kbd_proc(nCode, wParam, lParam):
+    global _f6_down
+    try:
+        if nCode == 0 and lParam:
+            kb = KBDLLHOOKSTRUCT.from_address(lParam)
+            if kb.vkCode == VK_F6:
+                if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    if not _f6_down:            # ignora la auto-repetición
+                        _f6_down = True
+                        if app is not None:
+                            app.after(0, app.toggle_enabled)
+                elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+                    _f6_down = False
+    except Exception:
+        pass
+    return _u32.CallNextHookEx(None, nCode, wParam, lParam)
+
+_ll_kbd_proc_c = HOOKPROC(_ll_kbd_proc)   # referencia viva para evitar el GC
+
+def _hook_thread():
+    _u32.SetWindowsHookExW(WH_MOUSE_LL,    _ll_mouse_proc_c, None, 0)
+    _u32.SetWindowsHookExW(WH_KEYBOARD_LL, _ll_kbd_proc_c,   None, 0)
+    msg = wintypes.MSG()
+    while _u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        _u32.TranslateMessage(ctypes.byref(msg))
+        _u32.DispatchMessageW(ctypes.byref(msg))
+
+def _start_input_listeners():
+    global _app_hwnd
+    try:
+        _app_hwnd = _u32.GetAncestor(app.winfo_id(), GA_ROOT)
+    except Exception:
+        _app_hwnd = None
+    threading.Thread(target=_hook_thread, daemon=True).start()
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
 def _make_tray_icon():
@@ -315,6 +516,10 @@ class GraffitiTitle(tk.Canvas):
         self._ot_tw = TW
         self._ot_th = TH
 
+    def set_ontop(self, on):
+        if bool(on) != self._ontop:
+            self._toggle_ontop()
+
     def _toggle_ontop(self, e=None):
         self._ontop = not self._ontop
         TX = self._ot_tx; Y0 = self._ot_y0; TH = self._ot_th; TW = self._ot_tw
@@ -337,8 +542,9 @@ class GraffitiTitle(tk.Canvas):
 
 
 class Ticker(tk.Canvas):
-    MSG = ("  *** AKA'S AUTOCLICKER v5.0 ***   "
-           "HOLD ANY MOUSE BUTTON TO RAPID FIRE   "
+    MSG = ("  *** AKA'S AUTOCLICKER v6.0 ***   "
+           "HOLD LEFT/MIDDLE TO RAPID FIRE   "
+           "RIGHT-CLICK = LOCK AUTOFIRE — MOVE MOUSE TO CANCEL   "
            "F6 = TOGGLE ON/OFF   "
            "GREETINGS TO: THE SCENE, OLD SCHOOL CODERS, DEMO LOVERS   "
            "THIS TOOL IS 100% FREE   "
@@ -437,37 +643,54 @@ def make_sep(parent,y,width=320):
 # ── App ───────────────────────────────────────────────────────────────────────
 class App(tk.Tk):
     W = 320
-    H = 480
+    H = 504
 
     def __init__(self):
         super().__init__()
+        self._cfg = load_config()
+        with state._lock:
+            state.interval_ms   = self._cfg["interval_ms"]
+            state.hold_delay_ms = self._cfg["hold_delay_ms"]
         self.title("Aka's AutoClicker")
         self.overrideredirect(True)
         self.resizable(False, False)
         self.geometry(f"{self.W}x{self.H}")
         self.configure(bg=BG)
+        # icono de ventana (barra de tareas / Alt-Tab) igual que el del tray
+        try:
+            self._icon_img = ImageTk.PhotoImage(_make_tray_icon())
+            self.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
         # borde exterior verde oscuro
         tk.Frame(self, bg=GREEN_DIM, bd=1).place(x=0,y=0,width=self.W,height=self.H)
         self._drag_x = 0
         self._drag_y = 0
         self._ontop  = False
         self._build()
-        self._center()
+        self._apply_saved_toggles()   # ontop/taskbar primero…
+        self._place_window()          # …y la posición al final, para que no la muevan
         self._start_tray()
+
+    def _apply_saved_toggles(self):
+        if self._cfg.get("ontop"):
+            self._gt.set_ontop(True)
+        if self._cfg.get("taskbar"):
+            self._set_taskbar(True)
 
     def _build(self):
         # starfield de fondo
         StarField(self, self.W, self.H).place(x=0, y=0)
 
         # título graffiti con X y ONTOP integrados, arrancando en y=2
-        gt = GraffitiTitle(
+        self._gt = GraffitiTitle(
             self,
             on_close      = self._quit_app,
             on_ontop      = self._set_ontop,
             on_drag_start = self._drag_start,
             on_drag_move  = self._drag_move,
         )
-        gt.place(x=0, y=2)
+        self._gt.place(x=0, y=2)
 
         Y = 94   # justo debajo del título
 
@@ -510,12 +733,12 @@ class App(tk.Tk):
 
         pf = tk.Frame(self, bg=BG)
         pf.place(x=20, y=Y+152)
-        for lbl,val in [("MAX",1),("50ms",50),("100ms",100),("250ms",250)]:
+        for lbl,val in [("MAX",1),("10ms",10),("50ms",50),("100ms",100),("250ms",250)]:
             tk.Button(pf, text=lbl, command=lambda v=val:self._set_interval(v),
                       font=("Courier New",8,"bold"), bg=GREY, fg=TEXT_MID,
                       activebackground=GREY2, activeforeground=GREEN,
-                      relief="flat", bd=0, padx=8, pady=3,
-                      cursor="hand2").pack(side="left", padx=(0,5))
+                      relief="flat", bd=0, padx=6, pady=3,
+                      cursor="hand2").pack(side="left", padx=(0,4))
 
         make_sep(self, Y+180)
 
@@ -541,11 +764,22 @@ class App(tk.Tk):
                        activeforeground=GREEN, relief="flat",
                        cursor="hand2").pack(anchor="w")
 
-        tk.Label(self, text="F6 = QUICK TOGGLE",
-                 font=("Courier New",8), bg=BG, fg=TEXT_DIM).place(x=20, y=Y+306)
+        tbf = tk.Frame(self, bg=BG)
+        tbf.place(x=20, y=Y+300)
+        self._taskbar_var = tk.BooleanVar(value=self._cfg.get("taskbar", False))
+        tk.Checkbutton(tbf, text="  SHOW IN TASKBAR",
+                       variable=self._taskbar_var,
+                       command=self._toggle_taskbar,
+                       font=("Courier New",9,"bold"), bg=BG, fg=TEXT_MID,
+                       selectcolor=GREEN_DIM, activebackground=BG,
+                       activeforeground=GREEN, relief="flat",
+                       cursor="hand2").pack(anchor="w")
 
-        make_sep(self, Y+324)
-        Ticker(self).place(x=0, y=Y+332)
+        tk.Label(self, text="F6 = QUICK TOGGLE   ·   RIGHT-CLICK = LOCK",
+                 font=("Courier New",8), bg=BG, fg=TEXT_DIM).place(x=20, y=Y+330)
+
+        make_sep(self, Y+348)
+        Ticker(self).place(x=0, y=Y+356)
 
     # ── drag ──────────────────────────────────────────────────────────────────
     def _drag_start(self, e):
@@ -559,6 +793,28 @@ class App(tk.Tk):
     def _set_ontop(self, on):
         self._ontop = on
         self.attributes("-topmost", on)
+
+    # ── barra de tareas ─────────────────────────────────────────────────────────
+    def _set_taskbar(self, on):
+        try:
+            self.update_idletasks()
+            hwnd  = _u32.GetAncestor(self.winfo_id(), GA_ROOT)
+            x, y  = self.winfo_x(), self.winfo_y()   # preservar posición
+            style = _GetWL(hwnd, GWL_EXSTYLE)
+            if on:
+                style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            else:
+                style = (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+            _SetWL(hwnd, GWL_EXSTYLE, style)
+            _u32.ShowWindow(hwnd, SW_HIDE)      # re-mostrar para refrescar la barra
+            _u32.ShowWindow(hwnd, SW_SHOW)
+            self.geometry(f"+{x}+{y}")          # restaurar posición tras el re-show
+            self.attributes("-topmost", self._ontop)
+        except Exception:
+            pass
+
+    def _toggle_taskbar(self):
+        self._set_taskbar(self._taskbar_var.get())
 
     # ── tray ──────────────────────────────────────────────────────────────────
     def _start_tray(self):
@@ -584,18 +840,51 @@ class App(tk.Tk):
 
     def _quit_app(self, icon=None, item=None):
         try: self._tray.stop()
-        except: pass
-        self.after(0, self.destroy)
+        except Exception: pass
+        self.after(0, self._shutdown)
+
+    def _shutdown(self):
+        self._save_current_config()
+        self.destroy()
+
+    def _save_current_config(self):
+        with state._lock:
+            interval = state.interval_ms
+            hold     = state.hold_delay_ms
+        try:
+            x, y = self.winfo_x(), self.winfo_y()
+        except Exception:
+            x, y = self._cfg.get("win_x"), self._cfg.get("win_y")
+        save_config({
+            "interval_ms":   interval,
+            "hold_delay_ms": hold,
+            "ontop":         self._ontop,
+            "taskbar":       bool(self._taskbar_var.get()),
+            "win_x":         x,
+            "win_y":         y,
+        })
 
     # ── autoclicker ───────────────────────────────────────────────────────────
     def toggle_enabled(self):
         with state._lock:
             state.enabled = not state.enabled; on = state.enabled
+            if not on: state.locked = False   # al desactivar, se suelta el lock
         self._btn.set_active(on)
-        self._status.config(
-            text=">_ STATUS: ACTIVE — HOLD MOUSE BTN" if on else ">_ STATUS: STANDBY",
-            fg=GREEN if on else TEXT_DIM)
+        self._refresh_status()
         maybe_start_thread()
+
+    def _refresh_status(self):
+        with state._lock:
+            on = state.enabled
+        self._status.config(
+            text=">_ STATUS: ACTIVE — HOLD / RIGHT-LOCK" if on else ">_ STATUS: STANDBY",
+            fg=GREEN if on else TEXT_DIM)
+
+    def _reflect_lock(self, on):
+        if on:
+            self._status.config(text=">_ STATUS: LOCKED — MOVE MOUSE TO CANCEL", fg=CYAN)
+        else:
+            self._refresh_status()
 
     def _on_hd_slider(self, val):
         v = int(val)
@@ -617,11 +906,22 @@ class App(tk.Tk):
         if self._startup_var.get(): add_to_startup()
         else: remove_from_startup()
 
-    def _center(self):
+    def _place_window(self):
         self.update_idletasks()
-        sw=self.winfo_screenwidth(); sh=self.winfo_screenheight()
-        self.geometry(f"{self.W}x{self.H}+{(sw-self.W)//2}+{(sh-self.H)//2}")
+        x = self._cfg.get("win_x"); y = self._cfg.get("win_y")
+        if x is None or y is None:                 # primera ejecución → centrar
+            sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+            x = (sw - self.W)//2; y = (sh - self.H)//2
+        else:                                      # clamp al escritorio virtual (multi-monitor)
+            vx = _u32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+            vy = _u32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+            vw = _u32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+            vh = _u32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            x = max(vx, min(int(x), vx + vw - self.W))
+            y = max(vy, min(int(y), vy + vh - self.H))
+        self.geometry(f"{self.W}x{self.H}+{int(x)}+{int(y)}")
 
 
 app = App()
+_start_input_listeners()   # arranca hook de ratón + teclado con la app ya creada
 app.mainloop()
