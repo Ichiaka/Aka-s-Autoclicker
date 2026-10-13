@@ -27,16 +27,28 @@ except ImportError:
     import pystray
     from PIL import Image, ImageDraw, ImageTk
 
-# ── ctypes mouse_event ────────────────────────────────────────────────────────
+# ── ctypes SendInput ──────────────────────────────────────────────────────────
 from ctypes import wintypes
 
 _u32 = ctypes.windll.user32
 ULONG_PTR = ctypes.c_size_t
 LRESULT   = ctypes.c_ssize_t
 
-_u32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
-                             wintypes.DWORD, ULONG_PTR]
-_u32.mouse_event.restype  = None
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+class _INPUTUNION(ctypes.Union):
+    # KEYBDINPUT/HARDWAREINPUT son más pequeños; MOUSEINPUT fija el tamaño
+    _fields_ = [("mi", MOUSEINPUT)]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+INPUT_MOUSE = 0
+_u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+_u32.SendInput.restype  = wintypes.UINT
 
 MOUSEEVENTF_LEFTDOWN   = 0x0002; MOUSEEVENTF_LEFTUP     = 0x0004
 MOUSEEVENTF_RIGHTDOWN  = 0x0008; MOUSEEVENTF_RIGHTUP    = 0x0010
@@ -47,10 +59,22 @@ _UP   = {"left":MOUSEEVENTF_LEFTUP,   "right":MOUSEEVENTF_RIGHTUP,   "middle":MO
 # Firma para marcar nuestros propios clicks inyectados y así no auto-dispararnos.
 INJECTED_SIGNATURE = 0xACC11CE5
 
-def _send_click(button):
-    _u32.mouse_event(_DOWN[button], 0, 0, 0, INJECTED_SIGNATURE)
-    time.sleep(0.002)
-    _u32.mouse_event(_UP[button],   0, 0, 0, INJECTED_SIGNATURE)
+def _send_mouse(flags):
+    """Inyecta en un solo SendInput los eventos de ratón indicados."""
+    n = len(flags)
+    arr = (INPUT * n)()
+    for i, f in enumerate(flags):
+        arr[i].type = INPUT_MOUSE
+        arr[i].u.mi = MOUSEINPUT(0, 0, 0, f, 0, INJECTED_SIGNATURE)
+    _u32.SendInput(n, arr, ctypes.sizeof(INPUT))
+
+def _send_clicks(buttons, press_s):
+    """Pulsa los botones, los mantiene press_s segundos y los suelta.
+    Muchas apps (juegos) leen el estado del ratón una vez por frame (~16 ms):
+    una pulsación más corta que eso puede no llegar a verse nunca."""
+    _send_mouse([_DOWN[b] for b in buttons])
+    time.sleep(press_s)
+    _send_mouse([_UP[b] for b in buttons])
 
 # ── Paleta ────────────────────────────────────────────────────────────────────
 BG        = "#050505"
@@ -71,7 +95,7 @@ REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
 # En modo script usa pythonw.exe para no abrir una consola al arrancar con Windows.
 _PYW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
 _RUN = _PYW if os.path.exists(_PYW) else sys.executable
-EXE_PATH = sys.executable if getattr(sys, 'frozen', False) else \
+EXE_PATH = f'"{sys.executable}"' if getattr(sys, 'frozen', False) else \
            f'"{_RUN}" "{os.path.abspath(__file__)}"'
 
 def is_in_startup():
@@ -94,8 +118,9 @@ def remove_from_startup():
 CONFIG_DIR  = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 CONFIG_DEFAULTS = {
-    "interval_ms":   50,
+    "interval_ms":   65,
     "hold_delay_ms": 300,
+    "press_ms":      40,
     "ontop":         False,
     "taskbar":       False,
     "win_x":         None,
@@ -128,8 +153,9 @@ class State:
     held_left      = False
     held_middle    = False
     locked         = False   # autoclick fijado (toggle con el botón derecho)
-    interval_ms    = 50
+    interval_ms    = 65
     hold_delay_ms  = 300    # ms que hay que mantener antes de empezar
+    press_ms       = 40     # ms que dura cada pulsación (DOWN → UP)
     _lock_x        = 0       # ancla para cancelar el lock al mover el ratón
     _lock_y        = 0
     _lock          = threading.Lock()
@@ -148,9 +174,10 @@ def click_loop():
             if state.held_middle:               buttons.append("middle")
             if not buttons: break
             interval = state.interval_ms / 1000.0
-        for btn in buttons:
-            _send_click(btn)
-        time.sleep(max(0.001, interval))
+            press    = state.press_ms / 1000.0
+        _send_clicks(buttons, press)
+        # el intervalo cuenta desde el inicio de la pulsación
+        time.sleep(max(0.001, interval - press))
 
 def _start_click_thread():
     """Arranca el hilo de clicks si el botón sigue pulsado tras el delay."""
@@ -381,15 +408,56 @@ def _start_input_listeners():
     threading.Thread(target=_hook_thread, daemon=True).start()
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
-def _make_tray_icon():
-    img  = Image.new("RGBA", (64, 64), (0,0,0,0))
+def _make_tray_icon(mode="off"):
+    """Icono del tray. Trazos gruesos para que se lea a 16 px.
+    off = octógono negro con borde y 'A' verdes · on = relleno rojo con 'A' negra
+    · lock = relleno cian con 'A' negra."""
+    S = 256                                   # se dibuja grande y se reduce (antialias)
+    img  = Image.new("RGBA", (S, S), (0,0,0,0))
     draw = ImageDraw.Draw(img)
-    pts  = [(16,2),(48,2),(62,16),(62,48),(48,62),(16,62),(2,48),(2,16)]
-    draw.polygon(pts, fill=(5,5,5,255), outline=(0,255,136,255))
-    draw.polygon([(32,10),(44,50),(40,50),(36,36),(28,36),(24,50),(20,50)],
-                 fill=(0,255,136,255))
-    draw.rectangle([27,28,37,33], fill=(5,5,5,255))
-    return img
+    c    = {"off": (0,255,136), "on": (255,51,51), "lock": (0,255,255)}[mode]
+    fill = (5,5,5,255) if mode == "off" else (*c, 255)
+    ink  = (*c, 255)   if mode == "off" else (5,5,5,255)
+    k = S/64
+    pts = [(x*k, y*k) for x, y in
+           [(18,1),(46,1),(63,18),(63,46),(46,63),(18,63),(1,46),(1,18)]]
+    draw.polygon(pts, fill=fill)
+    if mode == "off":                         # borde grueso
+        inner = [(x*k, y*k) for x, y in
+                 [(21,8),(43,8),(56,21),(56,43),(43,56),(21,56),(8,43),(8,21)]]
+        draw.polygon(pts, fill=ink); draw.polygon(inner, fill=fill)
+    # 'A' maciza
+    draw.polygon([(x*k, y*k) for x, y in
+                  [(27,15),(37,15),(48,49),(40,49),(37.5,41),(26.5,41),(24,49),(16,49)]],
+                 fill=ink)
+    draw.polygon([(x*k, y*k) for x, y in [(32,23),(34.8,34),(29.2,34)]], fill=fill)
+    return img.resize((64, 64), Image.LANCZOS)
+
+def _promote_tray_icon():
+    """Windows 11 esconde los iconos nuevos en el desplegable (^). Marca el
+    nuestro como visible en la barra (lo mismo que hacerlo desde Configuración).
+    Se identifica por el tooltip: la ruta guardada no siempre coincide con
+    sys.executable (alias de la Store, known folders…)."""
+    base = r"Control Panel\NotifyIconSettings"
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base)
+    except OSError:
+        return
+    i = 0
+    while True:
+        try:
+            sub = winreg.EnumKey(root, i); i += 1
+        except OSError:
+            break
+        try:
+            with winreg.OpenKey(root, sub, 0,
+                                winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as k:
+                tip, _ = winreg.QueryValueEx(k, "InitialTooltip")
+                if str(tip).startswith("Aka's AutoClicker"):
+                    winreg.SetValueEx(k, "IsPromoted", 0, winreg.REG_DWORD, 1)
+        except OSError:
+            pass
+    winreg.CloseKey(root)
 
 # ── Widgets ───────────────────────────────────────────────────────────────────
 
@@ -654,7 +722,7 @@ def make_sep(parent,y,width=320):
 # ── App ───────────────────────────────────────────────────────────────────────
 class App(tk.Tk):
     W = 320
-    H = 504
+    H = 548
 
     def __init__(self):
         super().__init__()
@@ -662,6 +730,7 @@ class App(tk.Tk):
         with state._lock:
             state.interval_ms   = self._cfg["interval_ms"]
             state.hold_delay_ms = self._cfg["hold_delay_ms"]
+            state.press_ms      = self._cfg["press_ms"]
         self.title("Aka's AutoClicker")
         self.overrideredirect(True)
         self.resizable(False, False)
@@ -669,8 +738,9 @@ class App(tk.Tk):
         self.configure(bg=BG)
         # icono de ventana (barra de tareas / Alt-Tab) igual que el del tray
         try:
-            self._icon_img = ImageTk.PhotoImage(_make_tray_icon())
-            self.iconphoto(True, self._icon_img)
+            self._win_icons = {m: ImageTk.PhotoImage(_make_tray_icon(m))
+                               for m in ("off", "on", "lock")}
+            self.iconphoto(True, self._win_icons["off"])
         except Exception:
             pass
         # borde exterior verde oscuro
@@ -753,19 +823,36 @@ class App(tk.Tk):
 
         make_sep(self, Y+180)
 
+        # ── press time ────────────────────────────────────────────────────────
+        tf = tk.Frame(self, bg=BG)
+        tf.place(x=20, y=Y+190)
+        tk.Label(tf, text=":: PRESS ::",
+                 font=("Courier New",8,"bold"), bg=BG, fg=TEXT_MID).pack(side="left")
+        self._pt_btns = {}
+        for val in (2, 10, 20, 40):
+            b = tk.Button(tf, text=f"{val}ms", command=lambda v=val: self._set_press(v),
+                          font=("Courier New",8,"bold"), bg=GREY, fg=TEXT_MID,
+                          activebackground=GREY2, activeforeground=GREEN,
+                          relief="flat", bd=0, padx=6, pady=3, cursor="hand2")
+            b.pack(side="left", padx=(6,0))
+            self._pt_btns[val] = b
+        self._set_press(state.press_ms)
+
+        make_sep(self, Y+224)
+
         self._btn = CrackButton(self, text="ACTIVATE",
                                 command=self.toggle_enabled,
                                 active_text="DEACTIVATE", active_fg=RED_AC)
-        self._btn.place(x=20, y=Y+192)
+        self._btn.place(x=20, y=Y+236)
 
         self._status = tk.Label(self, text=">_ STATUS: STANDBY",
                                 font=("Courier New",9,"bold"), bg=BG, fg=TEXT_DIM)
-        self._status.place(x=20, y=Y+246)
+        self._status.place(x=20, y=Y+290)
 
-        make_sep(self, Y+264)
+        make_sep(self, Y+308)
 
         cbf = tk.Frame(self, bg=BG)
-        cbf.place(x=20, y=Y+276)
+        cbf.place(x=20, y=Y+320)
         self._startup_var = tk.BooleanVar(value=is_in_startup())
         tk.Checkbutton(cbf, text="  BOOT WITH WINDOWS",
                        variable=self._startup_var,
@@ -776,7 +863,7 @@ class App(tk.Tk):
                        cursor="hand2").pack(anchor="w")
 
         tbf = tk.Frame(self, bg=BG)
-        tbf.place(x=20, y=Y+300)
+        tbf.place(x=20, y=Y+344)
         self._taskbar_var = tk.BooleanVar(value=self._cfg.get("taskbar", False))
         tk.Checkbutton(tbf, text="  SHOW IN TASKBAR",
                        variable=self._taskbar_var,
@@ -787,10 +874,10 @@ class App(tk.Tk):
                        cursor="hand2").pack(anchor="w")
 
         tk.Label(self, text="F6 = QUICK TOGGLE   ·   RIGHT-CLICK = LOCK",
-                 font=("Courier New",8), bg=BG, fg=TEXT_DIM).place(x=20, y=Y+330)
+                 font=("Courier New",8), bg=BG, fg=TEXT_DIM).place(x=20, y=Y+374)
 
-        make_sep(self, Y+348)
-        Ticker(self).place(x=0, y=Y+356)
+        make_sep(self, Y+392)
+        Ticker(self).place(x=0, y=Y+400)
 
     # ── drag ──────────────────────────────────────────────────────────────────
     def _drag_start(self, e):
@@ -835,9 +922,27 @@ class App(tk.Tk):
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Salir",     self._quit_app),
         )
-        self._tray = pystray.Icon("AkasAC", _make_tray_icon(),
-                                  "Aka's AutoClicker", menu)
+        self._tray_icons = {m: _make_tray_icon(m) for m in ("off", "on", "lock")}
+        self._tray = pystray.Icon("AkasAC", self._tray_icons["off"],
+                                  "Aka's AutoClicker — STANDBY", menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
+        # Windows registra el icono al mostrarlo; se promociona un poco después
+        self.after(3000, lambda: threading.Thread(target=_promote_tray_icon,
+                                                  daemon=True).start())
+
+    def _set_tray_mode(self, mode):
+        """Refleja el estado en el icono del tray, el de la barra de tareas y el título."""
+        tip = {"off": "STANDBY", "on": "ACTIVE", "lock": "LOCKED"}[mode]
+        self.title("Aka's AutoClicker" if mode == "off" else f"Aka's AutoClicker — {tip}")
+        try:
+            self.iconphoto(True, self._win_icons[mode])
+        except Exception:
+            pass
+        try:
+            self._tray.icon  = self._tray_icons[mode]
+            self._tray.title = f"Aka's AutoClicker — {tip}"
+        except Exception:
+            pass
 
     def _show_from_tray(self, icon=None, item=None):
         self.after(0, self._show_window)
@@ -862,6 +967,7 @@ class App(tk.Tk):
         with state._lock:
             interval = state.interval_ms
             hold     = state.hold_delay_ms
+            press    = state.press_ms
         try:
             x, y = self.winfo_x(), self.winfo_y()
         except Exception:
@@ -869,6 +975,7 @@ class App(tk.Tk):
         save_config({
             "interval_ms":   interval,
             "hold_delay_ms": hold,
+            "press_ms":      press,
             "ontop":         self._ontop,
             "taskbar":       bool(self._taskbar_var.get()),
             "win_x":         x,
@@ -890,10 +997,12 @@ class App(tk.Tk):
         self._status.config(
             text=">_ STATUS: ACTIVE — HOLD / RIGHT-LOCK" if on else ">_ STATUS: STANDBY",
             fg=GREEN if on else TEXT_DIM)
+        self._set_tray_mode("on" if on else "off")
 
     def _reflect_lock(self, on):
         if on:
             self._status.config(text=">_ STATUS: LOCKED — MOVE MOUSE TO CANCEL", fg=CYAN)
+            self._set_tray_mode("lock")
         else:
             self._refresh_status()
 
@@ -912,6 +1021,11 @@ class App(tk.Tk):
 
     def _set_interval(self, val):
         self._slider.set(val); self._on_slider(val)
+
+    def _set_press(self, val):
+        with state._lock: state.press_ms = int(val)
+        for v, b in self._pt_btns.items():
+            b.config(fg=CYAN if v == int(val) else TEXT_MID)
 
     def _toggle_startup(self):
         if self._startup_var.get(): add_to_startup()

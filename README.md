@@ -22,6 +22,24 @@
 
 ---
 
+## Install (one command)
+
+Open PowerShell and run:
+
+```powershell
+irm https://raw.githubusercontent.com/Ichiaka/Aka-s-Autoclicker/main/install.ps1 | iex
+```
+
+Downloads the latest release to `%LOCALAPPDATA%\Programs\AkasAutoClicker`, adds it to Windows startup, creates a Start Menu shortcut and launches it. No admin rights needed. Run it again to update.
+
+Uninstall:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Ichiaka/Aka-s-Autoclicker/main/install.ps1))) -Uninstall
+```
+
+---
+
 ## Requirements
 
 - Windows 10 / 11
